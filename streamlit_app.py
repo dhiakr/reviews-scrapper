@@ -202,30 +202,29 @@ if parsed:
         )
     sweep_all = st.checkbox(all_label, value=not is_google)
 
-    default_countries = parsed.country or "us"
+    country_fallback = (parsed.country or "us").upper()
     countries_raw = st.text_input(
-        "Countries (comma or space separated)",
-        value=default_countries,
+        "Countries (optional)",
+        value="",
+        placeholder="e.g. us gb pt",
         disabled=sweep_all,
-        help="e.g. us gb pt — each is scraped separately and merged. Ignored when "
-        "'Sweep ALL storefronts' is on.",
+        help="Optional. Comma or space separated; each is scraped and merged. "
+        f"Leave empty to use {country_fallback}. Ignored when 'Sweep ALL "
+        "storefronts' is on.",
     )
 
     languages_raw = ""
     if is_google:
         languages_raw = st.text_input(
-            "Languages (Google Play only)",
-            value="en",
-            help="e.g. en pt — the App Store is storefront/country based.",
+            "Languages (optional, Google Play only)",
+            value="",
+            placeholder="e.g. en pt",
+            help="Optional. Leave empty to use EN. The App Store is "
+            "storefront/country based and ignores this.",
         )
 
-    col_a, col_b = st.columns(2)
-    fetch_all = col_a.checkbox("Fetch all retrievable reviews", value=True)
+    # Always fetch all retrievable reviews by default.
     max_reviews = None
-    if not fetch_all:
-        max_reviews = col_b.number_input(
-            "Max per country/language", min_value=1, value=200, step=50
-        )
 
     newest_first = True
     if is_google:
@@ -254,10 +253,11 @@ if parsed:
             countries = list(ALL_COUNTRIES)
         else:
             countries = parse_codes(countries_raw)
+            if not countries:
+                # Optional field left empty — fall back to the URL's country, or us.
+                countries = [parsed.country or "us"]
+        # Languages optional; google_play defaults to EN when empty.
         languages = parse_codes(languages_raw)
-        if not countries:
-            st.error("Please enter at least one country code.")
-            st.stop()
 
         bar = st.progress(0.0, text="Starting…")
 
