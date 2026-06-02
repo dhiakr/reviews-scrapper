@@ -31,9 +31,55 @@ REVIEW_FIELDS = [
 ]
 
 
+# Best-effort map from a detected language to a representative country code.
+# Used to infer a Google Play review's country, since the public review data
+# does not include the reviewer's country (only the storefront we queried).
+LANG_TO_COUNTRY = {
+    "en": "us", "pt": "pt", "es": "es", "fr": "fr", "de": "de", "it": "it",
+    "nl": "nl", "pl": "pl", "ru": "ru", "tr": "tr", "ja": "jp", "ko": "kr",
+    "zh-cn": "cn", "zh-tw": "tw", "ar": "sa", "hi": "in", "id": "id",
+    "th": "th", "vi": "vn", "sv": "se", "da": "dk", "no": "no", "fi": "fi",
+    "cs": "cz", "el": "gr", "he": "il", "uk": "ua", "ro": "ro", "hu": "hu",
+    "bg": "bg", "hr": "hr", "sk": "sk", "ca": "es", "fa": "ir", "ms": "my",
+    "tl": "ph", "lt": "lt", "lv": "lv", "et": "ee", "sl": "si", "sr": "rs",
+}
+
+_LANGDETECT_READY = False
+
+
 def utc_now_iso() -> str:
     """Current UTC time as an ISO-8601 string (seconds precision)."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def detect_language(text: Optional[str]) -> Optional[str]:
+    """Detect the language code of a review's text.
+
+    Returns a lowercase code (e.g. ``pt``, ``en``, ``zh-cn``) or ``None`` when
+    detection isn't possible (empty/too-short text, or langdetect unavailable).
+    Deterministic: langdetect's RNG seed is pinned so repeated runs agree.
+    """
+    if not text or len(text.strip()) < 3:
+        return None
+    global _LANGDETECT_READY
+    try:
+        if not _LANGDETECT_READY:
+            from langdetect import DetectorFactory
+
+            DetectorFactory.seed = 0
+            _LANGDETECT_READY = True
+        from langdetect import detect
+
+        return detect(text).lower()
+    except Exception:  # noqa: BLE001 - any detection failure -> unknown
+        return None
+
+
+def infer_country(language: Optional[str]) -> Optional[str]:
+    """Best-effort country code for a detected language, or ``None``."""
+    if not language:
+        return None
+    return LANG_TO_COUNTRY.get(language.lower())
 
 
 def to_iso(value: Any) -> Optional[str]:

@@ -203,25 +203,26 @@ if parsed:
     sweep_all = st.checkbox(all_label, value=not is_google)
 
     country_fallback = (parsed.country or "us").upper()
+    country_help = (
+        "Optional storefront(s) to query, comma/space separated. "
+        f"Leave empty to use {country_fallback}."
+    )
+    if is_google:
+        country_help += (
+            " Each review's language and country are auto-detected from its text, "
+            "so one storefront already returns reviews in all languages."
+        )
     countries_raw = st.text_input(
         "Countries (optional)",
         value="",
         placeholder="e.g. us gb pt",
         disabled=sweep_all,
-        help="Optional. Comma or space separated; each is scraped and merged. "
-        f"Leave empty to use {country_fallback}. Ignored when 'Sweep ALL "
-        "storefronts' is on.",
+        help=country_help,
     )
 
+    # Language is auto-detected per review from its text — no input needed.
     languages_raw = ""
-    if is_google:
-        languages_raw = st.text_input(
-            "Languages (optional, Google Play only)",
-            value="",
-            placeholder="e.g. en pt",
-            help="Optional. Leave empty to use EN. The App Store is "
-            "storefront/country based and ignores this.",
-        )
+    st.caption("🌐 Language is auto-detected per review from its text.")
 
     # Always fetch all retrievable reviews by default.
     max_reviews = None

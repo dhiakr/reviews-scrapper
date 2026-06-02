@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from normalizer import make_review, utc_now_iso
+from normalizer import detect_language, infer_country, make_review, utc_now_iso
 from url_parser import PLATFORM_GOOGLE_PLAY
 
 logger = logging.getLogger(__name__)
@@ -28,16 +28,24 @@ def _raw_to_normalized(
     language: str,
     scraped_at: str,
 ) -> Dict[str, Any]:
+    text = raw.get("content")
+    # Detect the review's actual language from its text; the storefront `lang`
+    # we queried does not reflect what language the user wrote in. Infer the
+    # country from that language since Play review data omits the reviewer's
+    # country. Both fall back to the queried values when detection is uncertain.
+    detected_lang = detect_language(text)
+    review_language = detected_lang or language
+    review_country = infer_country(detected_lang) or country
     return make_review(
         platform=PLATFORM_GOOGLE_PLAY,
         source_url=source_url,
         app_id=app_id,
-        country=country,
-        language=language,
+        country=review_country,
+        language=review_language,
         review_id=raw.get("reviewId"),
         rating=raw.get("score"),
         title=None,  # Google Play reviews have no separate title.
-        text=raw.get("content"),
+        text=text,
         reviewer_name=raw.get("userName"),
         review_date=raw.get("at"),
         app_version=raw.get("reviewCreatedVersion") or raw.get("appVersion"),

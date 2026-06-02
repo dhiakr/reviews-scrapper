@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from normalizer import make_review, utc_now_iso
+from normalizer import detect_language, make_review, utc_now_iso
 from url_parser import PLATFORM_APP_STORE
 
 logger = logging.getLogger(__name__)
@@ -58,16 +58,21 @@ def _review_to_normalized(
     country: str,
     scraped_at: str,
 ) -> Dict[str, Any]:
+    title = _attr(review, "title")
+    text = _attr(review, "content", "review", "text", "body")
+    # Detect the language the review was written in. The storefront country is
+    # kept as-is (it is the real country where the review was posted).
+    language = detect_language(text) or detect_language(title)
     return make_review(
         platform=PLATFORM_APP_STORE,
         source_url=source_url,
         app_id=app_id,
         country=country,
-        language=None,  # App Store storefront is country-based, not language.
+        language=language,
         review_id=_attr(review, "id", "review_id"),
         rating=_attr(review, "rating", "score"),
-        title=_attr(review, "title"),
-        text=_attr(review, "content", "review", "text", "body"),
+        title=title,
+        text=text,
         reviewer_name=_attr(review, "user_name", "userName", "author", "nickname"),
         review_date=_attr(review, "date", "updated", "review_date"),
         app_version=_attr(review, "app_version", "version"),

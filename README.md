@@ -24,6 +24,8 @@ and severity.
     the storefront country from the path (e.g. `/us/app/...`) when present.
 - Configurable countries and languages.
 - Normalizes both stores into one common schema.
+- **Auto-detects each review's language** from its text (and, for Google Play,
+  infers the country from that language since the review data omits it).
 - Deterministic deduplication across repeated runs (idempotent).
 - Exports to **CSV** or **JSON**, and/or stores in **SQLite**.
 - Per-country failure isolation: one country failing does not abort the run, and
@@ -203,3 +205,7 @@ idempotency) and do **not** require network access.
   results.
 - **Deterministic by design.** AI is only applied *after* reviews are collected
   and stored, never inside the scraper.
+- **Language detection is best-effort.** Per-review language is detected with
+  `langdetect` (deterministic seed). Very short reviews can be mislabeled, and
+  closely related languages (e.g. Portuguese vs Spanish) are occasionally
+  confused. The detected language also drives the inferred Google Play country.
