@@ -10,6 +10,7 @@ public reviews — the store limits how far pagination goes per country/language
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from normalizer import make_review, utc_now_iso
@@ -46,6 +47,38 @@ def _raw_to_normalized(
     )
 
 
+# Number of reviews requested per page. Google caps this around 199.
+_PAGE_SIZE = 199
+
+
+def _fetch_page(reviews_fn, app_id, *, country, language, sort, count, token, retries):
+    """Fetch one page, retrying transient failures with exponential backoff."""
+    attempt = 0
+    while True:
+        try:
+            return reviews_fn(
+                app_id,
+                lang=language,
+                country=country,
+                sort=sort,
+                count=count,
+                continuation_token=token,
+            )
+        except Exception as exc:  # noqa: BLE001 - retry transient network errors
+            if attempt >= retries:
+                raise
+            attempt += 1
+            backoff = min(2 ** attempt * 0.5, 8.0)
+            logger.warning(
+                "Google Play page fetch failed (attempt %d/%d): %s — retrying in %.1fs",
+                attempt,
+                retries,
+                exc,
+                backoff,
+            )
+            time.sleep(backoff)
+
+
 def scrape(
     *,
     app_id: str,
@@ -54,36 +87,90 @@ def scrape(
     language: str = "en",
     max_reviews: Optional[int] = None,
     newest_first: bool = True,
+    page_delay_ms: int = 200,
+    max_retries: int = 4,
 ) -> List[Dict[str, Any]]:
     """Fetch retrievable public reviews for one app/country/language.
+
+    Pages manually through the public endpoint instead of ``reviews_all`` so we
+    can (a) pause ``page_delay_ms`` between pages and (b) retry. Crucially, when
+    Google ends pagination *after a full page* — the signature of throttling from
+    cloud/datacenter IPs — we re-request the same continuation token a few times
+    with backoff to squeeze past the cutoff. This recovers many more reviews when
+    the scraper runs on a throttled host, while still stopping cleanly on a
+    genuine end (a short final page).
 
     Returns normalized review dicts. Raises on hard scraper failures so the
     caller can record the failure per country and continue.
     """
     # Imported lazily so the package is only required when actually scraping
     # Google Play (keeps `group`-only usage dependency-light).
-    from google_play_scraper import Sort, reviews, reviews_all
+    from google_play_scraper import Sort, reviews
 
     sort = Sort.NEWEST if newest_first else Sort.MOST_RELEVANT
     scraped_at = utc_now_iso()
+    delay = max(page_delay_ms, 0) / 1000.0
 
-    if max_reviews is None:
-        # Page through everything the public endpoint will return.
-        raw_reviews = reviews_all(
+    raw_reviews: List[Dict[str, Any]] = []
+    token = None
+    while True:
+        if max_reviews is not None:
+            remaining = max_reviews - len(raw_reviews)
+            if remaining <= 0:
+                break
+            count = min(_PAGE_SIZE, remaining)
+        else:
+            count = _PAGE_SIZE
+
+        batch, new_token = _fetch_page(
+            reviews,
             app_id,
-            lang=language,
             country=country,
+            language=language,
             sort=sort,
-            sleep_milliseconds=100,
+            count=count,
+            token=token,
+            retries=max_retries,
         )
-    else:
-        raw_reviews, _ = reviews(
-            app_id,
-            lang=language,
-            country=country,
-            sort=sort,
-            count=max_reviews,
-        )
+        raw_reviews.extend(batch)
+        next_token = getattr(new_token, "token", None)
+
+        # A full page followed by a None token is suspicious: likely a throttled
+        # cutoff rather than the true end. Re-request the SAME token (same page
+        # content) with backoff to see if Google hands us a real next token.
+        if next_token is None and len(batch) >= count and max_retries > 0:
+            for attempt in range(1, max_retries + 1):
+                time.sleep(min(2 ** attempt * 0.5, 8.0))
+                _, recovered = _fetch_page(
+                    reviews,
+                    app_id,
+                    country=country,
+                    language=language,
+                    sort=sort,
+                    count=count,
+                    token=token,
+                    retries=0,
+                )
+                if getattr(recovered, "token", None) is not None:
+                    new_token = recovered
+                    next_token = recovered.token
+                    logger.info(
+                        "Recovered pagination after a throttled cutoff "
+                        "(attempt %d) at %d reviews.",
+                        attempt,
+                        len(raw_reviews),
+                    )
+                    break
+
+        if next_token is None:
+            break
+        token = new_token
+        if delay:
+            time.sleep(delay)
+
+    # Google returns a full page even when we request fewer, so trim to the cap.
+    if max_reviews is not None and len(raw_reviews) > max_reviews:
+        raw_reviews = raw_reviews[:max_reviews]
 
     logger.info(
         "Google Play: fetched %d raw reviews for %s [country=%s lang=%s]",

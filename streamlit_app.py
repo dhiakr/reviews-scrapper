@@ -52,7 +52,16 @@ def parse_codes(raw: str) -> list[str]:
     return seen
 
 
-def run_scrape(parsed, countries, languages, max_reviews, newest_first, progress=None):
+def run_scrape(
+    parsed,
+    countries,
+    languages,
+    max_reviews,
+    newest_first,
+    progress=None,
+    page_delay_ms=200,
+    max_retries=4,
+):
     """Scrape each country (and language for Play), isolating failures.
 
     ``progress`` is an optional callback ``(fraction, label)`` for a progress bar.
@@ -83,6 +92,8 @@ def run_scrape(parsed, countries, languages, max_reviews, newest_first, progress
                         language=language,
                         max_reviews=max_reviews,
                         newest_first=newest_first,
+                        page_delay_ms=page_delay_ms,
+                        max_retries=max_retries,
                     )
                 )
             else:
@@ -224,6 +235,20 @@ if parsed:
         "Download format", ["Excel (.xlsx)", "JSON (.json)"], horizontal=True
     )
 
+    page_delay_ms = 200
+    max_retries = 4
+    if is_google:
+        with st.expander("Advanced (Google Play throttling)"):
+            st.caption(
+                "Hosted/cloud servers get throttled by Google Play and may return "
+                "far fewer reviews than a local run. A higher delay and more retries "
+                "recover more reviews (slower)."
+            )
+            page_delay_ms = st.slider(
+                "Delay between pages (ms)", 0, 3000, 600, step=100
+            )
+            max_retries = st.slider("Retries per page", 0, 8, 5)
+
     if st.button("Scrape reviews", type="primary", use_container_width=True):
         if sweep_all:
             countries = list(ALL_COUNTRIES)
@@ -245,6 +270,8 @@ if parsed:
             reviews, failures = run_scrape(
                 parsed, countries, languages, max_reviews, newest_first,
                 progress=_progress,
+                page_delay_ms=page_delay_ms,
+                max_retries=max_retries,
             )
         bar.empty()
 

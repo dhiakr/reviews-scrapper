@@ -66,6 +66,8 @@ def _scrape_per_country(parsed, args) -> List[Dict[str, Any]]:
                         language=language,
                         max_reviews=args.max_reviews,
                         newest_first=not args.most_relevant,
+                        page_delay_ms=args.page_delay_ms,
+                        max_retries=args.retries,
                     )
                     collected.extend(reviews)
                     logger.info("OK Google Play %s: %d reviews", label, len(reviews))
@@ -196,6 +198,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--most-relevant",
         action="store_true",
         help="Fetch most-relevant first instead of newest first (Google Play).",
+    )
+    p_scrape.add_argument(
+        "--page-delay-ms",
+        type=int,
+        default=200,
+        dest="page_delay_ms",
+        help="Delay between Google Play review pages, in ms (default: 200). "
+        "Higher values reduce throttling on cloud/datacenter hosts.",
+    )
+    p_scrape.add_argument(
+        "--retries",
+        type=int,
+        default=4,
+        help="Retries per page, incl. recovering throttled cutoffs (default: 4).",
     )
     p_scrape.add_argument("--out", help="Export path (.csv or .json).")
     p_scrape.add_argument("--db", help="SQLite database path to store reviews.")
