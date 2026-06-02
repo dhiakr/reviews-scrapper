@@ -1,0 +1,10 @@
+# Core scraping dependencies for the review_scraper MVP.
+google-play-scraper>=1.2.7
+app-store-web-scraper>=0.2.0
+
+# Frontend + Excel export.
+streamlit>=1.30
+openpyxl>=3.1
+
+# Testing (optional, for the minimal test suite).
+pytest>=7.0
