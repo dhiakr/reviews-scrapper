@@ -17,6 +17,24 @@ from url_parser import PLATFORM_APP_STORE
 
 logger = logging.getLogger(__name__)
 
+# App Store storefront country codes (ISO 3166-1 alpha-2). Apple's public RSS
+# feed caps reviews at ~500 per storefront, so to collect "as much as they can"
+# you sweep every storefront and deduplicate. Use this with `--countries all`
+# (CLI) or the "all storefronts" option in the UI.
+ALL_COUNTRIES = [
+    "us", "gb", "ca", "au", "nz", "ie", "za", "in", "sg", "my", "ph", "hk",
+    "id", "th", "vn", "tw", "jp", "kr", "cn",
+    "de", "fr", "es", "it", "pt", "nl", "be", "lu", "at", "ch", "se", "no",
+    "dk", "fi", "is", "pl", "cz", "sk", "hu", "ro", "bg", "hr", "si", "rs",
+    "gr", "tr", "ua", "ee", "lv", "lt", "by", "md", "mt", "cy",
+    "br", "mx", "ar", "cl", "co", "pe", "ve", "ec", "uy", "py", "bo", "cr",
+    "gt", "hn", "ni", "pa", "sv", "do", "jm", "tt",
+    "ae", "sa", "qa", "kw", "bh", "om", "jo", "lb", "il", "eg", "ma", "dz",
+    "tn", "ng", "ke", "gh", "tz", "ug", "ci", "sn", "cm",
+    "pk", "bd", "lk", "np", "kz", "uz", "az", "ge", "am", "kh", "la", "mn",
+    "mo", "bn", "fj",
+]
+
 
 def _attr(obj: Any, *names: str) -> Optional[Any]:
     """Return the first present, non-None attribute among ``names``.

@@ -25,6 +25,7 @@ if PACKAGE_DIR not in sys.path:
 from exporters import reviews_to_bytes  # noqa: E402
 from normalizer import deduplicate  # noqa: E402
 from stores import app_store, google_play  # noqa: E402
+from stores.app_store import ALL_COUNTRIES  # noqa: E402
 from url_parser import (  # noqa: E402
     PLATFORM_APP_STORE,
     PLATFORM_GOOGLE_PLAY,
@@ -51,36 +52,40 @@ def parse_codes(raw: str) -> list[str]:
     return seen
 
 
-def run_scrape(parsed, countries, languages, max_reviews, newest_first):
+def run_scrape(parsed, countries, languages, max_reviews, newest_first, progress=None):
     """Scrape each country (and language for Play), isolating failures.
 
+    ``progress`` is an optional callback ``(fraction, label)`` for a progress bar.
     Returns ``(reviews, failures)`` where failures is a list of (label, error).
     """
     collected = []
     failures = []
 
+    # Build the full list of work items first so we can report progress.
     if parsed.platform == PLATFORM_GOOGLE_PLAY:
         languages = languages or ["en"]
-        for country in countries:
-            for language in languages:
-                label = f"{country}/{language}"
-                try:
-                    collected.extend(
-                        google_play.scrape(
-                            app_id=parsed.app_id,
-                            source_url=parsed.source_url,
-                            country=country,
-                            language=language,
-                            max_reviews=max_reviews,
-                            newest_first=newest_first,
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001 - isolate per target
-                    failures.append((label, str(exc)))
+        targets = [(c, lng) for c in countries for lng in languages]
     else:
-        for country in countries:
-            label = country
-            try:
+        targets = [(c, None) for c in countries]
+
+    total = max(len(targets), 1)
+    for i, (country, language) in enumerate(targets):
+        label = f"{country}/{language}" if language else country
+        if progress:
+            progress(i / total, label)
+        try:
+            if parsed.platform == PLATFORM_GOOGLE_PLAY:
+                collected.extend(
+                    google_play.scrape(
+                        app_id=parsed.app_id,
+                        source_url=parsed.source_url,
+                        country=country,
+                        language=language,
+                        max_reviews=max_reviews,
+                        newest_first=newest_first,
+                    )
+                )
+            else:
                 collected.extend(
                     app_store.scrape(
                         app_id=parsed.app_id,
@@ -89,9 +94,11 @@ def run_scrape(parsed, countries, languages, max_reviews, newest_first):
                         max_reviews=max_reviews,
                     )
                 )
-            except Exception as exc:  # noqa: BLE001 - isolate per target
-                failures.append((label, str(exc)))
+        except Exception as exc:  # noqa: BLE001 - isolate per target
+            failures.append((label, str(exc)))
 
+    if progress:
+        progress(1.0, "done")
     return deduplicate(collected), failures
 
 
@@ -173,11 +180,24 @@ if parsed:
 
     is_google = parsed.platform == PLATFORM_GOOGLE_PLAY
 
+    all_label = (
+        f"Sweep ALL {len(ALL_COUNTRIES)} storefronts to maximize total reviews "
+        "(slower)"
+    )
+    if not is_google:
+        all_label = (
+            f"Sweep ALL {len(ALL_COUNTRIES)} storefronts — recommended for the App "
+            "Store, which caps at ~500 reviews per country (slower)"
+        )
+    sweep_all = st.checkbox(all_label, value=not is_google)
+
     default_countries = parsed.country or "us"
     countries_raw = st.text_input(
         "Countries (comma or space separated)",
         value=default_countries,
-        help="e.g. us gb pt — each is scraped separately and merged.",
+        disabled=sweep_all,
+        help="e.g. us gb pt — each is scraped separately and merged. Ignored when "
+        "'Sweep ALL storefronts' is on.",
     )
 
     languages_raw = ""
@@ -205,16 +225,28 @@ if parsed:
     )
 
     if st.button("Scrape reviews", type="primary", use_container_width=True):
-        countries = parse_codes(countries_raw)
+        if sweep_all:
+            countries = list(ALL_COUNTRIES)
+        else:
+            countries = parse_codes(countries_raw)
         languages = parse_codes(languages_raw)
         if not countries:
             st.error("Please enter at least one country code.")
             st.stop()
 
+        bar = st.progress(0.0, text="Starting…")
+
+        def _progress(frac, label):
+            bar.progress(
+                min(frac, 1.0), text=f"Scraping {label}…  ({int(frac * 100)}%)"
+            )
+
         with st.spinner("Scraping reviews… this can take a while for large apps."):
             reviews, failures = run_scrape(
-                parsed, countries, languages, max_reviews, newest_first
+                parsed, countries, languages, max_reviews, newest_first,
+                progress=_progress,
             )
+        bar.empty()
 
         # Keep results in session so the download button doesn't re-scrape.
         st.session_state["reviews"] = reviews

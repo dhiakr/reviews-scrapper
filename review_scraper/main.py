@@ -36,6 +36,17 @@ from url_parser import (
 logger = logging.getLogger("review_scraper")
 
 
+def _expand_countries(countries) -> List[str]:
+    """Expand the special token ``all`` into every known storefront code.
+
+    ``--countries all`` sweeps every App Store storefront (and the same broad
+    list for Google Play) to collect as many reviews as the stores will return.
+    """
+    if countries and any(c.lower() == "all" for c in countries):
+        return list(app_store.ALL_COUNTRIES)
+    return [c.lower() for c in (countries or [])]
+
+
 def _scrape_per_country(parsed, args) -> List[Dict[str, Any]]:
     """Scrape each country/language, isolating failures so the run continues."""
     collected: List[Dict[str, Any]] = []
@@ -43,7 +54,8 @@ def _scrape_per_country(parsed, args) -> List[Dict[str, Any]]:
 
     if parsed.platform == PLATFORM_GOOGLE_PLAY:
         languages = args.lang or ["en"]
-        for country in args.countries:
+        countries = _expand_countries(args.countries) or ["us"]
+        for country in countries:
             for language in languages:
                 label = f"country={country} lang={language}"
                 try:
@@ -63,10 +75,11 @@ def _scrape_per_country(parsed, args) -> List[Dict[str, Any]]:
 
     elif parsed.platform == PLATFORM_APP_STORE:
         # Use CLI countries; if none given, fall back to the URL's country.
-        countries = args.countries or ([parsed.country] if parsed.country else [])
+        countries = _expand_countries(args.countries)
         if not countries:
-            countries = ["us"]
-            logger.warning("No country given and none in URL; defaulting to 'us'.")
+            countries = [parsed.country] if parsed.country else ["us"]
+            if not parsed.country:
+                logger.warning("No country given and none in URL; defaulting to 'us'.")
         for country in countries:
             label = f"country={country}"
             try:
@@ -162,7 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=[],
         metavar="CC",
-        help="Country codes to scrape (e.g. us gb pt).",
+        help="Country codes to scrape (e.g. us gb pt). Use 'all' to sweep every "
+        "known storefront (maximizes App Store coverage).",
     )
     p_scrape.add_argument(
         "--lang",
