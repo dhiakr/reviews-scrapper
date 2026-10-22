@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from normalizer import REVIEW_FIELDS, make_review, to_iso
+from normalizer import REVIEW_FIELDS, infer_country, make_review, to_iso
 
 
 def test_make_review_has_all_schema_fields():
@@ -36,6 +36,8 @@ def test_make_review_handles_missing_optionals():
     assert review["title"] is None
     assert review["rating"] is None
     assert review["language"] is None
+    assert review["query_language"] is None
+    assert review["reviewer_country"] is None
     assert review["developer_response"] is None
 
 
@@ -55,3 +57,16 @@ def test_to_iso_variants():
     assert to_iso("") is None
     assert to_iso("2024-05-01") == "2024-05-01"
     assert to_iso(datetime(2024, 5, 1)).startswith("2024-05-01")
+
+
+def test_query_context_is_separate_from_detected_language_and_reviewer_location():
+    review = make_review(
+        platform="google_play", source_url="u", app_id="app", country="gb",
+        query_language="en", language="pt", text="Um aplicativo excelente",
+    )
+    assert review["country"] == "gb"
+    assert review["query_language"] == "en"
+    assert review["language"] == "pt"
+    assert review["reviewer_country"] is None
+    assert infer_country("en") is None
+    assert infer_country("pt") is None

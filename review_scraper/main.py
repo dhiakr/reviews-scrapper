@@ -1,249 +1,182 @@
-"""Command-line entry point for the review scraper.
-
-Subcommands
------------
-scrape   Detect the store from a URL, collect retrievable public reviews for
-         the requested countries/languages, deduplicate, and export and/or
-         store them.
-group    Post-process already-collected reviews (CSV/JSON/SQLite) and add AI
-         grouping fields. Does not scrape.
-
-Run from inside the ``review_scraper`` directory:
-
-    python main.py scrape "<url>" --countries us gb --lang en --out reviews.csv
-    python main.py group --input reviews.csv --out grouped_reviews.csv
-"""
+"""CLI collection, scheduled archiving, and separate review grouping."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
-from typing import Any, Dict, List
+import time
+from contextlib import nullcontext
+from pathlib import Path
 
 from ai_grouping.classifier import classify_reviews
 from exporters import export_reviews, load_reviews
-from normalizer import deduplicate
+from jobs import SQLiteJobStore
+from runner import build_targets, run_job
 from storage import SQLiteReviewStore
-from stores import app_store, google_play
-from url_parser import (
-    PLATFORM_APP_STORE,
-    PLATFORM_GOOGLE_PLAY,
-    UrlParseError,
-    parse_url,
-)
+from stores.app_store import ALL_COUNTRIES
+from url_parser import PLATFORM_GOOGLE_PLAY, UrlParseError, parse_url
 
 logger = logging.getLogger("review_scraper")
 
 
-def _expand_countries(countries) -> List[str]:
-    """Expand the special token ``all`` into every known storefront code.
-
-    ``--countries all`` sweeps every App Store storefront (and the same broad
-    list for Google Play) to collect as many reviews as the stores will return.
-    """
-    if countries and any(c.lower() == "all" for c in countries):
-        return list(app_store.ALL_COUNTRIES)
-    return [c.lower() for c in (countries or [])]
+def _expand_countries(countries):
+    if countries and any(code.lower() == "all" for code in countries):
+        return list(ALL_COUNTRIES)
+    return list(dict.fromkeys(code.lower() for code in (countries or [])))
 
 
-def _scrape_per_country(parsed, args) -> List[Dict[str, Any]]:
-    """Scrape each country/language, isolating failures so the run continues."""
-    collected: List[Dict[str, Any]] = []
-    failures: List[str] = []
-
-    if parsed.platform == PLATFORM_GOOGLE_PLAY:
-        languages = args.lang or ["en"]
-        countries = _expand_countries(args.countries) or ["us"]
-        for country in countries:
-            for language in languages:
-                label = f"country={country} lang={language}"
-                try:
-                    reviews = google_play.scrape(
-                        app_id=parsed.app_id,
-                        source_url=parsed.source_url,
-                        country=country,
-                        language=language,
-                        max_reviews=args.max_reviews,
-                        newest_first=not args.most_relevant,
-                        page_delay_ms=args.page_delay_ms,
-                        max_retries=args.retries,
-                    )
-                    collected.extend(reviews)
-                    logger.info("OK Google Play %s: %d reviews", label, len(reviews))
-                except Exception as exc:  # noqa: BLE001 - isolate per-country failures
-                    failures.append(label)
-                    logger.error("FAILED Google Play %s: %s", label, exc)
-
-    elif parsed.platform == PLATFORM_APP_STORE:
-        # Use CLI countries; if none given, fall back to the URL's country.
-        countries = _expand_countries(args.countries)
-        if not countries:
-            countries = [parsed.country] if parsed.country else ["us"]
-            if not parsed.country:
-                logger.warning("No country given and none in URL; defaulting to 'us'.")
-        for country in countries:
-            label = f"country={country}"
-            try:
-                reviews = app_store.scrape(
-                    app_id=parsed.app_id,
-                    source_url=parsed.source_url,
-                    country=country,
-                    max_reviews=args.max_reviews,
-                )
-                collected.extend(reviews)
-                logger.info("OK App Store %s: %d reviews", label, len(reviews))
-            except Exception as exc:  # noqa: BLE001 - isolate per-country failures
-                failures.append(label)
-                logger.error("FAILED App Store %s: %s", label, exc)
-
-    if failures:
-        logger.warning(
-            "%d of the requested targets failed: %s. Continuing with partial "
-            "results.",
-            len(failures),
-            ", ".join(failures),
-        )
-    return collected
+def _positive(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
 
 
-def cmd_scrape(args) -> int:
+def _nonnegative(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return number
+
+
+def _job_path():
+    directory = Path(os.environ.get("REVIEW_SCRAPER_DATA_DIR",
+                                   str(Path(__file__).resolve().parents[1] / ".review_scraper")))
+    return str(directory / "jobs.sqlite3")
+
+
+def cmd_scrape(args):
     try:
         parsed = parse_url(args.url)
     except UrlParseError as exc:
         logger.error("Could not parse URL: %s", exc)
         return 2
+    path = Path(args.job_db)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteJobStore(str(path)) as store:
+        if args.resume:
+            try:
+                job = store.get_job(args.resume)
+            except KeyError:
+                logger.error("Saved run not found in %s", path)
+                return 2
+            config = job["config"]
+            if config["app_id"] != parsed.app_id or config["platform"] != parsed.platform:
+                logger.error("Recovery code belongs to a different app")
+                return 2
+            job_id = job["id"]
+            logger.info("Resuming original countries, languages and limits from saved run")
+        else:
+            countries = _expand_countries(args.countries) or [parsed.country or "us"]
+            languages = list(dict.fromkeys(code.lower() for code in (args.lang or ["en"])))
+            config = dict(platform=parsed.platform, app_id=parsed.app_id,
+                          source_url=parsed.source_url, countries=countries,
+                          languages=languages if parsed.platform == PLATFORM_GOOGLE_PLAY else [],
+                          max_reviews=args.max_reviews, newest_first=not args.most_relevant,
+                          page_delay_ms=args.page_delay_ms, max_retries=args.retries)
+            job_id = store.create_job(config, build_targets(parsed.platform, countries, languages))
+    logger.info("Saved run: %s (checkpoints: %s)", job_id, path)
+    archive = SQLiteReviewStore(args.db) if args.db else nullcontext(None)
+    try:
+        with archive as store:
+            job = run_job(str(path), job_id, on_page=store.upsert_many if store else None)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted. Completed pages saved; resume with --resume %s", job_id)
+        return 130
+    with SQLiteJobStore(str(path)) as store:
+        # When resuming with a newly supplied --db, include earlier saved pages.
+        if args.db or args.out:
+            reviews = store.fetch_reviews(job_id)
+            if args.db:
+                with SQLiteReviewStore(args.db) as archive:
+                    archive.upsert_many(reviews)
+            if args.out:
+                logger.info("Exported %d unique reviews to %s",
+                            export_reviews(reviews, args.out), args.out)
+    logger.info("%s: %d unique reviews, date range %s to %s", job["status"],
+                job["review_count"], job["oldest_review_date"], job["newest_review_date"])
+    for target in job["targets"]:
+        logger.info("%s: %s, %d saved, stop=%s%s", target["id"], target["status"],
+                    target["review_count"], target["stop_reason"],
+                    f", error={target['error']}" if target.get("error") else "")
+    logger.warning("Collected public-feed coverage only; historical completeness is unknown.")
+    if args.report:
+        Path(args.report).write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0 if job["status"] == "finished" else 1
 
-    logger.info(
-        "Detected platform=%s app_id=%s", parsed.platform, parsed.app_id
-    )
 
-    reviews = _scrape_per_country(parsed, args)
-    reviews = deduplicate(reviews)
-    logger.info("Collected %d unique reviews after deduplication.", len(reviews))
-
-    if not reviews:
-        logger.warning("No reviews collected. Nothing to export or store.")
-
-    # Store in SQLite if requested (also deduplicates across past runs).
-    if args.db:
-        with SQLiteReviewStore(args.db) as store:
-            result = store.upsert_many(reviews)
-        logger.info(
-            "SQLite %s: %d new, %d updated (idempotent).",
-            args.db,
-            result.inserted,
-            result.updated,
-        )
-
-    # Export to a file if requested.
-    if args.out:
-        written = export_reviews(reviews, args.out)
-        logger.info("Exported %d reviews to %s", written, args.out)
-
-    if not args.db and not args.out:
-        logger.warning(
-            "Neither --out nor --db given; results were collected but not "
-            "persisted. Use --out FILE and/or --db FILE."
-        )
-
-    return 0
+def cmd_watch(args):
+    """Repeat fresh collection runs; page upserts maintain the archive."""
+    cycle = 0
+    last_code = 0
+    try:
+        while args.cycles is None or cycle < args.cycles:
+            cycle += 1
+            logger.info("Scheduled collection cycle %d", cycle)
+            last_code = cmd_scrape(args)
+            if last_code in {2, 130}:
+                return last_code
+            if args.cycles is None or cycle < args.cycles:
+                time.sleep(args.interval)
+    except KeyboardInterrupt:
+        logger.info("Scheduled collection stopped")
+        return 130
+    return last_code
 
 
-def cmd_group(args) -> int:
+def cmd_group(args):
     reviews = load_reviews(args.input)
-    logger.info("Loaded %d reviews from %s", len(reviews), args.input)
     grouped = classify_reviews(reviews, backend=args.backend)
-    written = export_reviews(grouped, args.out)
-    logger.info("Wrote %d grouped reviews to %s", written, args.out)
+    logger.info("Wrote %d grouped reviews to %s", export_reviews(grouped, args.out), args.out)
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="review_scraper",
-        description="Collect retrievable public app reviews from Google Play "
-        "and the Apple App Store.",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable debug logging."
-    )
+def build_parser():
+    parser = argparse.ArgumentParser(prog="review_scraper",
+                                     description="Collect retrievable public app reviews with saved progress.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    p_scrape = sub.add_parser("scrape", help="Scrape reviews from a store URL.")
-    p_scrape.add_argument("url", help="Google Play or Apple App Store URL.")
-    p_scrape.add_argument(
-        "--countries",
-        nargs="+",
-        default=[],
-        metavar="CC",
-        help="Country codes to scrape (e.g. us gb pt). Use 'all' to sweep every "
-        "known storefront (maximizes App Store coverage).",
-    )
-    p_scrape.add_argument(
-        "--lang",
-        nargs="+",
-        default=None,
-        metavar="LANG",
-        help="Language codes (Google Play only; e.g. en pt). Default: en.",
-    )
-    p_scrape.add_argument(
-        "--max-reviews",
-        type=int,
-        default=None,
-        dest="max_reviews",
-        help="Cap reviews fetched per country/language (default: all retrievable).",
-    )
-    p_scrape.add_argument(
-        "--most-relevant",
-        action="store_true",
-        help="Fetch most-relevant first instead of newest first (Google Play).",
-    )
-    p_scrape.add_argument(
-        "--page-delay-ms",
-        type=int,
-        default=200,
-        dest="page_delay_ms",
-        help="Delay between Google Play review pages, in ms (default: 200). "
-        "Higher values reduce throttling on cloud/datacenter hosts.",
-    )
-    p_scrape.add_argument(
-        "--retries",
-        type=int,
-        default=4,
-        help="Retries per page, incl. recovering throttled cutoffs (default: 4).",
-    )
-    p_scrape.add_argument("--out", help="Export path (.csv or .json).")
-    p_scrape.add_argument("--db", help="SQLite database path to store reviews.")
-    p_scrape.set_defaults(func=cmd_scrape)
-
-    p_group = sub.add_parser(
-        "group", help="AI-group already-collected reviews (no scraping)."
-    )
-    p_group.add_argument(
-        "--input", required=True, help="Input reviews file (.csv or .json)."
-    )
-    p_group.add_argument(
-        "--out", required=True, help="Output path for grouped reviews (.csv or .json)."
-    )
-    p_group.add_argument(
-        "--backend",
-        default="rule_based",
-        choices=["rule_based", "llm"],
-        help="Classification backend (default: rule_based, deterministic).",
-    )
-    p_group.set_defaults(func=cmd_group)
-
+    for command in ("scrape", "watch"):
+        scrape = sub.add_parser(command, help="Collect reviews" if command == "scrape"
+                               else "Repeat collection on an always-on host")
+        scrape.add_argument("url", help="Google Play or Apple App Store URL")
+        scrape.add_argument("--countries", nargs="+", default=[], metavar="CC",
+                            help="Storefront codes; 'all' uses the configured country list")
+        scrape.add_argument("--lang", nargs="+", default=None, metavar="LANG",
+                            help="Google query languages, e.g. en pt es (default: en)")
+        scrape.add_argument("--max-reviews", type=_positive, default=None,
+                            help="Cap per country/language; omitted = all retrievable")
+        scrape.add_argument("--most-relevant", action="store_true")
+        scrape.add_argument("--page-delay-ms", type=_nonnegative, default=600)
+        scrape.add_argument("--retries", type=_nonnegative, default=5)
+        scrape.add_argument("--out", help="Export .csv, .json or .xlsx")
+        scrape.add_argument("--db", required=command == "watch", help="Persistent SQLite review archive")
+        scrape.add_argument("--job-db", default=_job_path(), help="SQLite saved runs and checkpoints")
+        scrape.add_argument("--report", help="Write a JSON coverage report")
+        if command == "scrape":
+            scrape.add_argument("--resume", help="Recovery code; uses the saved run's original options")
+            scrape.set_defaults(func=cmd_scrape)
+        else:
+            scrape.add_argument("--interval", type=_positive, default=3600,
+                                help="Seconds between completed runs (default: 3600)")
+            scrape.add_argument("--cycles", type=_positive, default=None,
+                                help="Stop after this many runs; omitted = run until stopped")
+            scrape.set_defaults(func=cmd_watch, resume=None)
+    group = sub.add_parser("group", help="Classify already collected reviews")
+    group.add_argument("--input", required=True)
+    group.add_argument("--out", required=True)
+    group.add_argument("--backend", default="rule_based", choices=["rule_based", "llm"])
+    group.set_defaults(func=cmd_group)
     return parser
 
 
-def main(argv=None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(message)s",
-    )
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s")
     return args.func(args)
 
 

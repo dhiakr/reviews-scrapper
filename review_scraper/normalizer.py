@@ -17,6 +17,8 @@ REVIEW_FIELDS = [
     "source_url",
     "app_id",
     "country",
+    "query_language",
+    "reviewer_country",
     "language",
     "review_id",
     "rating",
@@ -30,19 +32,6 @@ REVIEW_FIELDS = [
     "scraped_at",
 ]
 
-
-# Best-effort map from a detected language to a representative country code.
-# Used to infer a Google Play review's country, since the public review data
-# does not include the reviewer's country (only the storefront we queried).
-LANG_TO_COUNTRY = {
-    "en": "us", "pt": "pt", "es": "es", "fr": "fr", "de": "de", "it": "it",
-    "nl": "nl", "pl": "pl", "ru": "ru", "tr": "tr", "ja": "jp", "ko": "kr",
-    "zh-cn": "cn", "zh-tw": "tw", "ar": "sa", "hi": "in", "id": "id",
-    "th": "th", "vi": "vn", "sv": "se", "da": "dk", "no": "no", "fi": "fi",
-    "cs": "cz", "el": "gr", "he": "il", "uk": "ua", "ro": "ro", "hu": "hu",
-    "bg": "bg", "hr": "hr", "sk": "sk", "ca": "es", "fa": "ir", "ms": "my",
-    "tl": "ph", "lt": "lt", "lv": "lv", "et": "ee", "sl": "si", "sr": "rs",
-}
 
 _LANGDETECT_READY = False
 
@@ -76,10 +65,13 @@ def detect_language(text: Optional[str]) -> Optional[str]:
 
 
 def infer_country(language: Optional[str]) -> Optional[str]:
-    """Best-effort country code for a detected language, or ``None``."""
-    if not language:
-        return None
-    return LANG_TO_COUNTRY.get(language.lower())
+    """Deprecated: a reviewer's country cannot be inferred from a language.
+
+    Kept for callers of older versions; always returns unknown. ``country``
+    records the queried storefront and ``reviewer_country`` is only populated
+    when a source actually supplies it.
+    """
+    return None
 
 
 def to_iso(value: Any) -> Optional[str]:
@@ -107,6 +99,8 @@ def make_review(
     source_url: str,
     app_id: str,
     country: Optional[str],
+    query_language: Optional[str] = None,
+    reviewer_country: Optional[str] = None,
     language: Optional[str] = None,
     review_id: Optional[str] = None,
     rating: Any = None,
@@ -125,6 +119,8 @@ def make_review(
         "source_url": source_url,
         "app_id": app_id,
         "country": country,
+        "query_language": query_language,
+        "reviewer_country": reviewer_country,
         "language": language,
         "review_id": str(review_id) if review_id is not None else None,
         "rating": _clean_int(rating),
@@ -143,7 +139,8 @@ def compute_dedup_key(review: Dict[str, Any]) -> str:
     """Return a stable deduplication key for a normalized review.
 
     Rules:
-    * Prefer ``platform + app_id + country + review_id`` when a review_id exists.
+    * Prefer ``platform + app_id + review_id`` when a review_id exists. The
+      same public review can appear in several country/language queries.
     * Otherwise hash ``platform + app_id + country + rating + title + text +
       review_date`` so repeated runs stay idempotent.
     """
@@ -152,8 +149,8 @@ def compute_dedup_key(review: Dict[str, Any]) -> str:
     country = review.get("country") or ""
     review_id = review.get("review_id")
 
-    if review_id:
-        return f"{platform}|{app_id}|{country}|{review_id}"
+    if review_id is not None and str(review_id).strip():
+        return f"{platform}|{app_id}|{review_id}"
 
     parts = [
         platform,
@@ -168,14 +165,61 @@ def compute_dedup_key(review: Dict[str, Any]) -> str:
     return f"{platform}|{app_id}|{country}|h:{digest}"
 
 
+def _timestamp(value: Any) -> float:
+    """Compare ISO timestamps even when offsets or precision differ."""
+    if not value:
+        return float("-inf")
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return float("-inf")
+
+
+def merge_reviews(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the latest snapshot while retaining useful omitted fields.
+
+    Repeated storefronts and resumed pages can return an older copy of an
+    edited review. Prefer the most recently fetched copy, then the review's
+    date, and independently retain the latest dated developer response.
+    """
+    def freshness(review):
+        fetched = _timestamp(review.get("scraped_at"))
+        if fetched == float("-inf"):
+            fetched = _timestamp(review.get("updated_at"))
+        return (fetched, _timestamp(review.get("review_date")))
+
+    older, newer = (existing, incoming)
+    if freshness(existing) > freshness(incoming):
+        older, newer = incoming, existing
+    merged = dict(older)
+    merged.update({key: value for key, value in newer.items() if value is not None and value != ""})
+    # Query context belongs to the chosen snapshot. Unknown detection is also
+    # meaningful: an edited review with unrecognizable text must not inherit
+    # the previous text's detected language.
+    for field in ("country", "query_language", "language"):
+        if field in newer:
+            merged[field] = newer[field]
+    # A later fetch may contain a cached, older developer response.
+    if _timestamp(older.get("developer_response_date")) > _timestamp(newer.get("developer_response_date")):
+        for field in ("developer_response", "developer_response_date"):
+            if older.get(field) is not None:
+                merged[field] = older[field]
+    return merged
+
+
 def deduplicate(reviews) -> list:
-    """Remove duplicate reviews (by dedup key), preserving first-seen order."""
-    seen = set()
+    """Merge duplicate identities, preserving the first-seen ordering."""
+    positions = {}
     out = []
     for review in reviews:
         key = compute_dedup_key(review)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(review)
+        if key in positions:
+            index = positions[key]
+            out[index] = merge_reviews(out[index], review)
+        else:
+            positions[key] = len(out)
+            out.append(review)
     return out

@@ -12,7 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List
 
-from normalizer import REVIEW_FIELDS, compute_dedup_key, utc_now_iso
+from normalizer import REVIEW_FIELDS, compute_dedup_key, merge_reviews, utc_now_iso
 
 
 @dataclass
@@ -59,8 +59,10 @@ class SQLiteReviewStore(ReviewStore):
 
     def __init__(self, path: str):
         self.path = path
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=30)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 30000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -71,27 +73,95 @@ class SQLiteReviewStore(ReviewStore):
             affinity = "INTEGER" if name == "rating" else "TEXT"
             column_defs.append(f"{name} {affinity}")
         columns = ",\n                ".join(column_defs)
-        self.conn.executescript(
-            f"""
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            previous_fields = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(reviews)")
+            }
+            self.conn.execute(f"""
             CREATE TABLE IF NOT EXISTS reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 dedup_key TEXT NOT NULL,
                 {columns},
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_dedup_key
-                ON reviews (dedup_key);
-            """
+            )
+            """)
+            for name in REVIEW_FIELDS:
+                if previous_fields and name not in previous_fields:
+                    affinity = "INTEGER" if name == "rating" else "TEXT"
+                    self.conn.execute(f"ALTER TABLE reviews ADD COLUMN {name} {affinity}")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS review_scraper_schema_versions "
+                "(component TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+            )
+            version = self.conn.execute(
+                "SELECT version FROM review_scraper_schema_versions WHERE component = 'reviews'"
+            ).fetchone()
+            if not version or version["version"] < 2:
+                self._migrate_identity(
+                    legacy_google_provenance=bool(previous_fields) and "query_language" not in previous_fields
+                )
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO review_scraper_schema_versions (component, version) "
+                    "VALUES ('reviews', 2)"
+                )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_dedup_key ON reviews (dedup_key)"
+            )
+
+    def _migrate_identity(self, *, legacy_google_provenance: bool) -> None:
+        """Rebuild identities transactionally; old country-specific keys may collide.
+
+        Work in a separate table so a failed migration leaves the old data
+        intact. Process one row at a time to avoid loading the archive in RAM.
+        Older Google rows contain inferred countries; their true queried
+        storefront is unavailable and must be marked unknown.
+        """
+        columns = ", ".join(
+            f"{name} {'INTEGER' if name == 'rating' else 'TEXT'}" for name in REVIEW_FIELDS
         )
-        self.conn.commit()
+        self.conn.execute(f"""
+            CREATE TABLE reviews_identity_migration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedup_key TEXT NOT NULL UNIQUE,
+                {columns},
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        fieldnames = ["id", "dedup_key", *REVIEW_FIELDS, "created_at", "updated_at"]
+        sql = (
+            f"INSERT INTO reviews_identity_migration ({', '.join(fieldnames)}) "
+            f"VALUES ({', '.join('?' for _ in fieldnames)})"
+        )
+        for row in self.conn.execute("SELECT * FROM reviews ORDER BY id"):
+            review = dict(row)
+            if legacy_google_provenance and review.get("platform") == "google_play":
+                review["country"] = None
+                review["reviewer_country"] = None
+            key = compute_dedup_key(review)
+            existing = self.conn.execute(
+                "SELECT * FROM reviews_identity_migration WHERE dedup_key = ?", (key,)
+            ).fetchone()
+            if existing:
+                merged = merge_reviews(dict(existing), review)
+                merged["id"] = existing["id"]
+                merged["created_at"] = min(existing["created_at"], review["created_at"])
+                merged["updated_at"] = max(existing["updated_at"], review["updated_at"])
+                self.conn.execute(
+                    "DELETE FROM reviews_identity_migration WHERE dedup_key = ?", (key,)
+                )
+                review = merged
+            review["dedup_key"] = key
+            self.conn.execute(sql, [review.get(name) for name in fieldnames])
+        self.conn.execute("DROP TABLE reviews")
+        self.conn.execute("ALTER TABLE reviews_identity_migration RENAME TO reviews")
 
     def upsert_many(self, reviews: Iterable[Dict[str, Any]]) -> UpsertResult:
         now = utc_now_iso()
         inserted = 0
         updated = 0
-        cur = self.conn.cursor()
-
         placeholders = ", ".join(["?"] * (len(REVIEW_FIELDS) + 3))
         col_list = ", ".join(["dedup_key", *REVIEW_FIELDS, "created_at", "updated_at"])
         # On conflict, refresh mutable fields (e.g. a newly added developer
@@ -106,21 +176,23 @@ class SQLiteReviewStore(ReviewStore):
             f"updated_at=excluded.updated_at"
         )
 
-        for review in reviews:
-            dedup_key = compute_dedup_key(review)
-            exists = cur.execute(
-                "SELECT 1 FROM reviews WHERE dedup_key = ?", (dedup_key,)
-            ).fetchone()
-            values = [dedup_key]
-            values.extend(review.get(field) for field in REVIEW_FIELDS)
-            values.extend([now, now])
-            cur.execute(sql, values)
-            if exists:
-                updated += 1
-            else:
-                inserted += 1
-
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            for review in reviews:
+                dedup_key = compute_dedup_key(review)
+                exists = self.conn.execute(
+                    f"SELECT {', '.join(REVIEW_FIELDS)} FROM reviews WHERE dedup_key = ?", (dedup_key,)
+                ).fetchone()
+                if exists:
+                    review = merge_reviews(dict(exists), review)
+                values = [dedup_key]
+                values.extend(review.get(field) for field in REVIEW_FIELDS)
+                values.extend([now, now])
+                self.conn.execute(sql, values)
+                if exists:
+                    updated += 1
+                else:
+                    inserted += 1
         return UpsertResult(inserted=inserted, updated=updated)
 
     def fetch_all(self) -> List[Dict[str, Any]]:

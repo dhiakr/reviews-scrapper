@@ -91,17 +91,27 @@ def _rows_to_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
+_EXCEL_MAX_ROWS = 1_048_576
+
+
 def _rows_to_xlsx_bytes(rows: List[Dict[str, Any]]) -> bytes:
     # openpyxl is imported lazily so CSV/JSON-only usage doesn't require it.
     from openpyxl import Workbook
 
     fieldnames = _ordered_fieldnames(rows)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "reviews"
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("reviews")
     ws.append(fieldnames)
+    sheet_number = 1
+    sheet_rows = 1
     for row in rows:
+        if sheet_rows >= _EXCEL_MAX_ROWS:
+            sheet_number += 1
+            ws = wb.create_sheet(f"reviews_{sheet_number}")
+            ws.append(fieldnames)
+            sheet_rows = 1
         ws.append([_xlsx_cell(row.get(key)) for key in fieldnames])
+        sheet_rows += 1
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
