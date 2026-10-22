@@ -1,6 +1,9 @@
+import sys
 from datetime import datetime
+from types import SimpleNamespace
 
-from normalizer import REVIEW_FIELDS, infer_country, make_review, to_iso
+import normalizer
+from normalizer import REVIEW_FIELDS, detect_language, infer_country, make_review, to_iso
 
 
 def test_make_review_has_all_schema_fields():
@@ -70,3 +73,32 @@ def test_query_context_is_separate_from_detected_language_and_reviewer_location(
     assert review["reviewer_country"] is None
     assert infer_country("en") is None
     assert infer_country("pt") is None
+
+
+def test_language_detection_reuses_duplicate_text_without_growing_forever(monkeypatch):
+    calls = []
+    factory = SimpleNamespace(seed=None)
+
+    def detect(text):
+        calls.append(text)
+        return "EN"
+
+    monkeypatch.setitem(sys.modules, "langdetect", SimpleNamespace(DetectorFactory=factory, detect=detect))
+    monkeypatch.setattr(normalizer, "_LANGDETECT_READY", False)
+    detect_language.cache_clear()
+    try:
+        assert detect_language("A repeated review") == "en"
+        assert detect_language("A repeated review") == "en"
+        assert calls == ["A repeated review"]
+        assert factory.seed == 0
+        # New unique reviews eventually evict old entries instead of retaining
+        # every review ever encountered by a long-running worker.
+        for index in range(4096):
+            assert detect_language(f"Another review {index}") == "en"
+        assert detect_language.cache_info().currsize == 4096
+        assert detect_language("A repeated review") == "en"
+        assert calls.count("A repeated review") == 2
+        assert detect_language(None) is None
+        assert detect_language("?") is None
+    finally:
+        detect_language.cache_clear()

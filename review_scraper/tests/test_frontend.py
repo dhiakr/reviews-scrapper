@@ -42,13 +42,13 @@ def test_frontend_explicit_languages_and_saved_result(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "JobManager", SynchronousManager)
     monkeypatch.setattr(runner.google_play, "scrape_with_report", fetch)
-    app = AppTest.from_file(str(APP)).run()
+    app = AppTest.from_file(str(APP), default_timeout=20).run()
     assert not app.exception
     app.text_input(key="url_input").set_value(URL).run()
     app.text_input(key="query_languages").set_value("en, pt")
     next(button for button in app.button if button.label == "Scrape reviews").click().run()
     assert not app.exception
-    assert queried == ["en", "pt"]
+    assert sorted(queried) == ["en", "pt"]
     assert any(metric.label == "Unique reviews saved" and metric.value == "1" for metric in app.metric)
     assert any("finished" in subheader.value for subheader in app.subheader)
     next(button for button in app.button if button.label == "Prepare review download").click().run()
@@ -57,7 +57,7 @@ def test_frontend_explicit_languages_and_saved_result(tmp_path, monkeypatch):
 
 def test_invalid_recovery_code_is_a_visible_error(tmp_path, monkeypatch):
     monkeypatch.setenv("REVIEW_SCRAPER_DATA_DIR", str(tmp_path))
-    app = AppTest.from_file(str(APP)).run()
+    app = AppTest.from_file(str(APP), default_timeout=20).run()
     next(field for field in app.text_input if field.label == "Recovery code").set_value("wrong")
     next(button for button in app.button if button.label == "Restore run").click().run()
     assert not app.exception

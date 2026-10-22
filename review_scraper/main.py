@@ -8,7 +8,6 @@ import logging
 import os
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
 from ai_grouping.classifier import classify_reviews
@@ -76,26 +75,28 @@ def cmd_scrape(args):
                           source_url=parsed.source_url, countries=countries,
                           languages=languages if parsed.platform == PLATFORM_GOOGLE_PLAY else [],
                           max_reviews=args.max_reviews, newest_first=not args.most_relevant,
-                          page_delay_ms=args.page_delay_ms, max_retries=args.retries)
+                          page_delay_ms=args.page_delay_ms, max_retries=args.retries,
+                          target_workers=args.workers)
             job_id = store.create_job(config, build_targets(parsed.platform, countries, languages))
     logger.info("Saved run: %s (checkpoints: %s)", job_id, path)
-    archive = SQLiteReviewStore(args.db) if args.db else nullcontext(None)
+    def archive_page(rows):
+        # Callbacks run on target threads; SQLite connections stay thread-local.
+        with SQLiteReviewStore(args.db) as archive:
+            archive.upsert_many(rows)
+
     try:
-        with archive as store:
-            job = run_job(str(path), job_id, on_page=store.upsert_many if store else None)
+        job = run_job(str(path), job_id, on_page=archive_page if args.db else None)
     except KeyboardInterrupt:
         logger.warning("Interrupted. Completed pages saved; resume with --resume %s", job_id)
         return 130
     with SQLiteJobStore(str(path)) as store:
         # When resuming with a newly supplied --db, include earlier saved pages.
-        if args.db or args.out:
-            reviews = store.fetch_reviews(job_id)
-            if args.db:
-                with SQLiteReviewStore(args.db) as archive:
-                    archive.upsert_many(reviews)
-            if args.out:
-                logger.info("Exported %d unique reviews to %s",
-                            export_reviews(reviews, args.out), args.out)
+        if args.db:
+            with SQLiteReviewStore(args.db) as archive:
+                archive.upsert_many(store.iter_reviews(job_id))
+        if args.out:
+            logger.info("Exported %d unique reviews to %s",
+                        export_reviews(store.fetch_reviews(job_id), args.out), args.out)
     logger.info("%s: %d unique reviews, date range %s to %s", job["status"],
                 job["review_count"], job["oldest_review_date"], job["newest_review_date"])
     for target in job["targets"]:
@@ -152,6 +153,8 @@ def build_parser():
         scrape.add_argument("--most-relevant", action="store_true")
         scrape.add_argument("--page-delay-ms", type=_nonnegative, default=600)
         scrape.add_argument("--retries", type=_nonnegative, default=5)
+        scrape.add_argument("--workers", type=int, choices=range(1, 5), default=2,
+                            help="Parallel country/language queries, 1-4 (default: 2)")
         scrape.add_argument("--out", help="Export .csv, .json or .xlsx")
         scrape.add_argument("--db", required=command == "watch", help="Persistent SQLite review archive")
         scrape.add_argument("--job-db", default=_job_path(), help="SQLite saved runs and checkpoints")

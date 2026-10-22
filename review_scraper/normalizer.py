@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Dict, Optional
 
 # Canonical field order for the normalized review schema. Exporters and the
@@ -41,12 +42,14 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+@lru_cache(maxsize=4096)
 def detect_language(text: Optional[str]) -> Optional[str]:
     """Detect the language code of a review's text.
 
     Returns a lowercase code (e.g. ``pt``, ``en``, ``zh-cn``) or ``None`` when
     detection isn't possible (empty/too-short text, or langdetect unavailable).
     Deterministic: langdetect's RNG seed is pinned so repeated runs agree.
+    A bounded cache avoids repeating detection across storefront queries.
     """
     if not text or len(text.strip()) < 3:
         return None

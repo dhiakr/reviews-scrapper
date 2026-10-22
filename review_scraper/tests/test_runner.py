@@ -1,6 +1,7 @@
 """Integration regressions for partial jobs, recovery and scheduled archives."""
 
 import json
+import threading
 
 import main
 import runner
@@ -21,7 +22,7 @@ def review(review_id, country="us", language="en"):
 
 def test_partial_page_survives_worker_failure_and_resume_skips_finished_targets(tmp_path, monkeypatch):
     path = str(tmp_path / "jobs.sqlite3")
-    config = dict(platform="google_play", app_id="com.example.app", source_url=URL)
+    config = dict(platform="google_play", app_id="com.example.app", source_url=URL, target_workers=1)
     with SQLiteJobStore(path) as store:
         job_id = store.create_job(config, runner.build_targets("google_play", ["us", "pt"], ["en"]))
     calls = []
@@ -113,3 +114,23 @@ def test_watch_upserts_archive_across_runs(tmp_path, monkeypatch):
         rows = store.fetch_all()
     assert len(rows) == 1
     assert rows[0]["text"] == "Edit 2"
+
+
+def test_independent_targets_actually_run_in_parallel(tmp_path, monkeypatch):
+    path = str(tmp_path / "jobs.sqlite3")
+    barrier = threading.Barrier(2, timeout=5)
+    with SQLiteJobStore(path) as store:
+        job_id = store.create_job(
+            dict(platform="google_play", app_id="com.example.app", source_url=URL, target_workers=2),
+            runner.build_targets("google_play", ["us", "pt"], ["en"]),
+        )
+
+    def fetch(**kwargs):
+        barrier.wait()  # Sequential execution fails instead of silently passing.
+        cursor = {"fetched": 1, "pages_fetched": 1, "complete": True}
+        kwargs["on_page"]([review(kwargs["country"])], cursor)
+        return ScrapeResult([], "finished", "endpoint_end", 1, cursor)
+
+    monkeypatch.setattr(runner.google_play, "scrape_with_report", fetch)
+    job = runner.run_job(path, job_id)
+    assert job["status"] == "finished" and job["review_count"] == 2

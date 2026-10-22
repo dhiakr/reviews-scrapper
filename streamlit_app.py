@@ -104,6 +104,8 @@ if parsed:
                                 min_value=0, value=0, step=100)
         page_delay_ms = st.slider("Delay between pages (ms)", 0, 3000, 600, step=100)
         max_retries = st.slider("Retries per page", 0, 8, 5)
+        target_workers = st.slider("Parallel country/language queries", 1, 4, 2,
+                                   help="Two is a balanced default. Reduce to one if stores throttle requests.")
         st.caption("Slower requests can reduce transient failures. They cannot remove feed limits.")
     active = any(manager.is_running(job_id) for job_id in st.session_state.job_ids)
     if st.button("Scrape reviews", type="primary", disabled=active):
@@ -118,7 +120,7 @@ if parsed:
                           source_url=parsed.source_url, countries=countries,
                           languages=languages, max_reviews=int(limit) or None,
                           newest_first=newest_first, page_delay_ms=page_delay_ms,
-                          max_retries=max_retries)
+                          max_retries=max_retries, target_workers=target_workers)
             with SQLiteJobStore(db_path) as store:
                 job_id = store.create_job(config, build_targets(parsed.platform, countries, languages))
             st.session_state.job_ids.append(job_id)
@@ -182,7 +184,7 @@ def show_job(job_id):
             "stop_reason": (target.get("stop_reason") or "").replace("_", " "),
             "error": target.get("error") or "",
         })
-    st.dataframe(coverage, hide_index=True, use_container_width=True)
+    st.dataframe(coverage, hide_index=True, width="stretch")
     warnings = dict.fromkeys(warning for target in job["targets"]
                              for warning in (target.get("warnings") or []))
     for warning in warnings:
@@ -203,7 +205,7 @@ def show_job(job_id):
                "Streamlit Community Cloud may reset local files during redeploys; "
                "download results before then. Collection pauses when the host stops.")
     if preview:
-        st.dataframe(preview, hide_index=True, use_container_width=True)
+        st.dataframe(preview, hide_index=True, width="stretch")
         st.caption(f"Showing up to 200 of {job.get('review_count', 0)} saved reviews.")
         fmt = st.selectbox("Download format", ["csv", "json", "xlsx"], key=f"format_{job_id}")
         if st.button("Prepare review download", key=f"prepare_{job_id}"):

@@ -271,6 +271,14 @@ class SQLiteJobStore:
                 "UPDATE collection_jobs SET updated_at = ? WHERE id = ?", (now, job_id),
             )
 
+    def iter_reviews(self, job_id: str):
+        """Stream an archive replay without loading the whole run into RAM."""
+        self._require_job(job_id)
+        for row in self.conn.execute(
+            "SELECT review_json FROM collection_reviews WHERE job_id = ? ORDER BY id", (job_id,),
+        ):
+            yield json.loads(row["review_json"])
+
     def fetch_reviews(self, job_id: str, limit: Optional[int] = None) -> list[dict]:
         self._require_job(job_id)
         if limit is not None and (not isinstance(limit, int) or limit < 0):

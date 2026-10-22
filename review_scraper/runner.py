@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from jobs import SQLiteJobStore
@@ -27,6 +27,46 @@ def build_targets(platform, countries, languages=None):
     return [{"id": country, "country": country, "language": None} for country in countries]
 
 
+def _run_target(path, job_id, config, target, should_stop, on_page):
+    """One target, one SQLite connection owned by its worker thread."""
+    if should_stop():
+        return
+    with SQLiteJobStore(path) as store:
+        target_id = target["id"]
+        store.update_target(job_id, target_id, status="running", error=None)
+
+        def save_page(rows, checkpoint):
+            if on_page:
+                on_page(rows)
+            store.save_page(job_id, target_id, rows, checkpoint)
+
+        kwargs = dict(
+            app_id=config["app_id"], source_url=config["source_url"],
+            country=target["country"], max_reviews=config.get("max_reviews"),
+            page_delay_ms=config.get("page_delay_ms", 600),
+            max_retries=config.get("max_retries", 5),
+            resume=target.get("checkpoint") or None,
+            on_page=save_page, should_stop=should_stop, retain_reviews=False,
+        )
+        adapter = app_store
+        if config["platform"] == PLATFORM_GOOGLE_PLAY:
+            adapter = google_play
+            kwargs.update(language=target["language"],
+                          newest_first=config.get("newest_first", True))
+        try:
+            result = adapter.scrape_with_report(**kwargs)
+        except Exception as exc:
+            logger.exception("Collection failed for %s", target_id)
+            store.update_target(job_id, target_id, status="failed",
+                                stop_reason="worker_error", error=str(exc))
+            return
+        store.update_target(
+            job_id, target_id, status=result.status, stop_reason=result.stop_reason,
+            error=result.error, pages_fetched=result.pages_fetched,
+            warnings=result.warnings, checkpoint=result.checkpoint,
+        )
+
+
 def run_job(
     path: str,
     job_id: str,
@@ -35,64 +75,38 @@ def run_job(
 ):
     """Persist pages before advancing a cursor; retry only unfinished targets.
 
-    ``on_page`` lets a CLI caller also maintain a lifetime review archive.
-    Each worker opens its own SQLite connection.
+    ``on_page`` may run on several threads; any archive writer must open a
+    connection on the calling thread. At most four targets run concurrently.
     """
     should_stop = should_stop or (lambda: False)
     with SQLiteJobStore(path) as store:
         job = store.get_job(job_id)
         config = job["config"]
         store.set_job_status(job_id, "running")
+        stopped = threading.Event()
+
+        def stop_requested():
+            return stopped.is_set() or should_stop()
+
         try:
-            for target in job["targets"]:
-                if target["status"] in _DONE:
-                    continue
-                if should_stop():
-                    store.set_job_status(job_id, "cancelled")
-                    return store.get_job(job_id)
-                target_id = target["id"]
-                store.update_target(job_id, target_id, status="running", error=None)
-
-                def save_page(rows, checkpoint):
-                    # Archive first: replaying a page is safe if job persistence
-                    # fails, while advancing the cursor first could lose rows.
-                    if on_page:
-                        on_page(rows)
-                    store.save_page(job_id, target_id, rows, checkpoint)
-
-                kwargs = dict(
-                    app_id=config["app_id"], source_url=config["source_url"],
-                    country=target["country"], max_reviews=config.get("max_reviews"),
-                    page_delay_ms=config.get("page_delay_ms", 600),
-                    max_retries=config.get("max_retries", 5),
-                    resume=target.get("checkpoint") or None,
-                    on_page=save_page, should_stop=should_stop,
-                    retain_reviews=False,
-                )
-                adapter = app_store
-                if config["platform"] == PLATFORM_GOOGLE_PLAY:
-                    adapter = google_play
-                    kwargs.update(language=target["language"],
-                                  newest_first=config.get("newest_first", True))
+            workers = max(1, min(4, int(config.get("target_workers", 2))))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="store-query") as executor:
+                futures = [executor.submit(_run_target, path, job_id, config, target,
+                                           stop_requested, on_page)
+                           for target in job["targets"] if target["status"] not in _DONE]
                 try:
-                    result = adapter.scrape_with_report(**kwargs)
-                except Exception as exc:
-                    logger.exception("Collection failed for %s", target_id)
-                    store.update_target(job_id, target_id, status="failed",
-                                        stop_reason="worker_error", error=str(exc))
-                    continue
-                store.update_target(
-                    job_id, target_id, status=result.status,
-                    stop_reason=result.stop_reason, error=result.error,
-                    pages_fetched=result.pages_fetched, warnings=result.warnings,
-                    checkpoint=result.checkpoint,
-                )
-                if result.status == "cancelled":
-                    store.set_job_status(job_id, "cancelled")
-                    return store.get_job(job_id)
+                    for future in as_completed(futures):
+                        future.result()
+                except BaseException:
+                    stopped.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
             job = store.get_job(job_id)
             statuses = [target["status"] for target in job["targets"]]
-            if all(status in _DONE for status in statuses):
+            if should_stop() or "cancelled" in statuses:
+                status = "cancelled"
+            elif all(status in _DONE for status in statuses):
                 status = "finished"
             elif job.get("review_count", 0):
                 status = "partial"
